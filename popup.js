@@ -2,7 +2,28 @@
 
 const btnSummarize = document.getElementById('btn-summarize');
 const pills        = document.querySelectorAll('.pill');
+const apiKeyInput  = document.getElementById('api-key-input');
 let selectedLevel  = 'standard';
+
+// ── Load saved API key ────────────────────────────────────────────────────────
+chrome.storage.local.get('groqApiKey', ({ groqApiKey }) => {
+  if (groqApiKey) {
+    apiKeyInput.value = groqApiKey;
+    apiKeyInput.classList.add('saved');
+  }
+});
+
+// ── Save API key on change ────────────────────────────────────────────────────
+apiKeyInput.addEventListener('input', () => {
+  apiKeyInput.classList.remove('saved');
+});
+
+apiKeyInput.addEventListener('change', () => {
+  const key = apiKeyInput.value.trim();
+  chrome.storage.local.set({ groqApiKey: key }, () => {
+    if (key) apiKeyInput.classList.add('saved');
+  });
+});
 
 // ── Detail level ─────────────────────────────────────────────────────────────
 pills.forEach(pill => {

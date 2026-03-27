@@ -1,5 +1,4 @@
 // content.js — injected at document_idle
-// All summarization happens here, in the browser, with no network calls.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1.  TEXT EXTRACTION
@@ -76,173 +75,20 @@ function extractPageContent() {
   return text.slice(0, 14000);
 }
 
-// Also grab all heading texts for bonus scoring
-function extractHeadings() {
-  return Array.from(document.querySelectorAll('h1,h2,h3'))
-    .map(h => h.textContent.trim())
-    .filter(Boolean)
-    .join(' ');
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// 2.  EXTRACTIVE SUMMARISER
+// 2.  CLAUDE SUMMARISER (via background service worker)
 // ─────────────────────────────────────────────────────────────────────────────
-const STOPWORDS = new Set([
-  'the','a','an','and','or','but','in','on','at','to','for','of','with',
-  'by','from','as','is','was','are','were','be','been','being','have','has',
-  'had','do','does','did','will','would','could','should','may','might',
-  'this','that','these','those','it','its','they','their','there','here',
-  'then','than','when','where','why','how','what','which','who','whom','so',
-  'if','not','no','can','just','also','more','very','all','any','some',
-  'one','two','three','into','about','over','after','before','between',
-  'up','out','our','your','my','we','he','she','his','her','i','you','me',
-]);
-
-// Sentence tokeniser — handles common abbreviations to avoid false splits
-function tokenizeSentences(text) {
-  // Mark known abbreviation periods so they don't trigger splits
-  const abbrevs = /\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|vs|etc|eg|ie|Fig|No|Vol|pp|ed|al|approx|dept|est|avg|approx|Gov|Sgt|Cpl|Corp|Inc|Ltd|Co|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\./gi;
-  const safe = text.replace(abbrevs, (m) => m.replace('.', '⟨DOT⟩'));
-
-  // Split on sentence-ending punctuation followed by whitespace + capital
-  const raw = safe.split(/(?<=[.!?]["']?)\s+(?=[A-Z"'])/);
-
-  return raw
-    .map(s => s.replace(/⟨DOT⟩/g, '.').trim())
-    .filter(s => {
-      const words = s.split(/\s+/);
-      return words.length >= 6 && s.length >= 30;
-    });
-}
-
-function computeWordScores(sentences) {
-  const freq = {};
-  sentences.forEach(s => {
-    s.toLowerCase().match(/\b[a-z]{3,}\b/g)?.forEach(w => {
-      if (!STOPWORDS.has(w)) freq[w] = (freq[w] || 0) + 1;
-    });
+function callClaude(content, title, level) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { action: 'claude:summarize', content, title, level },
+      (response) => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (response?.error)          return reject(new Error(response.error));
+        resolve(response.summary);
+      }
+    );
   });
-  const max = Math.max(...Object.values(freq), 1);
-  const scores = {};
-  Object.entries(freq).forEach(([w, f]) => { scores[w] = f / max; });
-  return scores;
-}
-
-function scoreSentences(sentences, wordScores, title, headings) {
-  const titleWords = new Set((title + ' ' + headings).toLowerCase().match(/\b[a-z]{3,}\b/g) || []);
-  const total      = sentences.length;
-
-  // Detect named entities: words that appear capitalised mid-sentence (not just at start)
-  const entityFreq = {};
-  sentences.forEach(s => {
-    (s.match(/(?<!\. )[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*/g) || []).forEach(e => {
-      entityFreq[e] = (entityFreq[e] || 0) + 1;
-    });
-  });
-  const entityWords = new Set(
-    Object.entries(entityFreq).filter(([,f]) => f >= 2).map(([e]) => e.toLowerCase())
-  );
-
-  return sentences.map((text, i) => {
-    const words  = text.toLowerCase().match(/\b[a-z]{3,}\b/g) || [];
-    const unique = new Set(words.filter(w => !STOPWORDS.has(w)));
-
-    // TF score
-    let tfScore = 0;
-    unique.forEach(w => { tfScore += (wordScores[w] || 0); });
-    tfScore = unique.size > 0 ? tfScore / unique.size : 0;
-
-    // Position bonus — opening and closing sentences carry more weight
-    const r = i / total;
-    const posScore = r < 0.12 ? 1.7 : r < 0.25 ? 1.25 : r > 0.90 ? 0.85 : 1.0;
-
-    // Length — sweet spot 12-50 words
-    const wc = words.length;
-    const lenScore = wc < 6 ? 0.2 : wc < 12 ? 0.7 : wc > 70 ? 0.45 : wc > 55 ? 0.7 : 1.0;
-
-    // Title / heading overlap
-    const titleHits  = [...unique].filter(w => titleWords.has(w)).length;
-    const titleScore = 1 + Math.min(titleHits * 0.3, 1.2);
-
-    // Named-entity richness
-    const entityHits  = [...unique].filter(w => entityWords.has(w)).length;
-    const entityScore = 1 + Math.min(entityHits * 0.2, 0.8);
-
-    // Stat / data bonus
-    const numBonus = /\b\d[\d,.%$£€]*\b/.test(text) ? 1.2 : 1.0;
-
-    // Definitional bonus
-    const defBonus = /\b(is|are|was|were|refers to|defined as|known as|means|involves|consists of|describes)\b/i.test(text) ? 1.15 : 1.0;
-
-    // Causal / insight bonus
-    const insightBonus = /\b(because|therefore|however|although|despite|result|cause|lead|impact|effect|significant|critical|important|key|major|primary)\b/i.test(text) ? 1.1 : 1.0;
-
-    return {
-      text,
-      index: i,
-      score: tfScore * posScore * lenScore * titleScore * entityScore * numBonus * defBonus * insightBonus,
-    };
-  });
-}
-
-function buildSummary(content, title, headings, level) {
-  const sentences = tokenizeSentences(content);
-
-  if (sentences.length < 3) {
-    // Not enough material — return raw excerpt
-    return {
-      title:     truncate(title || document.title, 80),
-      overview:  content.slice(0, 400),
-      keyPoints: [],
-      takeaway:  '',
-    };
-  }
-
-  const wordScores = computeWordScores(sentences);
-  const scored     = scoreSentences(sentences, wordScores, title, headings);
-
-  // How many sentences to pull for each section
-  const cfg = {
-    brief:    { ov: 2, kp: 3, ta: 1 },
-    standard: { ov: 2, kp: 5, ta: 1 },
-    detailed: { ov: 3, kp: 8, ta: 1 },
-  };
-  const { ov, kp, ta } = cfg[level] || cfg.standard;
-  const needed = ov + kp + ta;
-
-  // Deduplicate very similar sentences (cosine-ish overlap > 0.6)
-  const top = [];
-  const used = new Set();
-  for (const s of [...scored].sort((a, b) => b.score - a.score)) {
-    if (top.length >= needed) break;
-    const words = new Set(s.text.toLowerCase().match(/\b[a-z]{4,}\b/g) || []);
-    let tooSimilar = false;
-    for (const prev of top) {
-      const prevWords = new Set(prev.text.toLowerCase().match(/\b[a-z]{4,}\b/g) || []);
-      const inter = [...words].filter(w => prevWords.has(w)).length;
-      const union = new Set([...words, ...prevWords]).size;
-      if (union > 0 && inter / union > 0.55) { tooSimilar = true; break; }
-    }
-    if (!tooSimilar) top.push(s);
-  }
-
-  // Re-order by original position
-  top.sort((a, b) => a.index - b.index);
-
-  const overviewSents = top.slice(0, ov);
-  const kpSents       = top.slice(ov, ov + kp);
-  const taSent        = top[top.length - 1];
-
-  return {
-    title:     truncate(title || document.title, 80),
-    overview:  overviewSents.map(s => s.text).join(' '),
-    keyPoints: kpSents.map(s => s.text),
-    takeaway:  taSent?.text || '',
-  };
-}
-
-function truncate(str, max) {
-  return str.length > max ? str.slice(0, max - 1) + '…' : str;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -546,7 +392,7 @@ function renderModal(state, data = {}) {
         </button>
         ${state === 'summary' ? `<button class="btn-speak" id="g-speak">${ICON_SPEAKER} Read Aloud</button>` : ''}
       </div>
-      <div class="powered-by">Runs <span>100% in browser</span></div>
+      <div class="powered-by">Powered by <span>Groq</span></div>
     </div>`;
 
   shadowRoot.innerHTML = `
@@ -682,11 +528,9 @@ function esc(str) {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action !== 'glimpse:summarize') return;
 
-  // Show loading state immediately
   renderModal('loading');
 
-  // Small delay so the loading animation is visible before CPU work
-  setTimeout(() => {
+  (async () => {
     try {
       const content = extractPageContent();
       if (!content || content.length < 150) {
@@ -694,13 +538,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return;
       }
 
-      const headings = extractHeadings();
-      const summary  = buildSummary(content, document.title, headings, message.level || 'standard');
+      const summary = await callClaude(content, document.title, message.level || 'standard');
       renderModal('summary', { summary });
     } catch (err) {
       renderModal('error', { error: err.message || 'Unexpected error during summarisation.' });
     }
-  }, 120);
+  })();
 
   sendResponse({ ok: true });
   return true;
